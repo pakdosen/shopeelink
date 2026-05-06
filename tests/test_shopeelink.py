@@ -42,6 +42,14 @@ class ConvertToProductUrlTests(unittest.TestCase):
             "https://shopee.co.id/product/123456/7890123",
         )
 
+    def test_shp_ee_host_falls_back_to_main_storefront(self) -> None:
+        # /product/<shop>/<item> is what id.shp.ee redirects to as the path.
+        url = "https://id.shp.ee/product/270387150/25170072348"
+        self.assertEqual(
+            shopeelink.convert_to_product_url(url),
+            "https://shopee.co.id/product/270387150/25170072348",
+        )
+
     def test_other_locale(self) -> None:
         url = "https://shopee.sg/product/998877/776655"
         self.assertEqual(
@@ -52,6 +60,23 @@ class ConvertToProductUrlTests(unittest.TestCase):
     def test_invalid_url_raises(self) -> None:
         with self.assertRaises(shopeelink.ShopeeLinkError):
             shopeelink.convert_to_product_url("https://example.com/not/a/product")
+
+
+class IsShortLinkHostTests(unittest.TestCase):
+    def test_s_shopee_subdomain(self) -> None:
+        self.assertTrue(shopeelink._is_short_link_host("s.shopee.co.id"))
+        self.assertTrue(shopeelink._is_short_link_host("s.shopee.com.my"))
+
+    def test_shp_ee_variants(self) -> None:
+        self.assertTrue(shopeelink._is_short_link_host("shp.ee"))
+        self.assertTrue(shopeelink._is_short_link_host("id.shp.ee"))
+        self.assertTrue(shopeelink._is_short_link_host("my.shp.ee"))
+        self.assertTrue(shopeelink._is_short_link_host("ID.SHP.EE"))
+
+    def test_canonical_storefronts_are_not_short_links(self) -> None:
+        self.assertFalse(shopeelink._is_short_link_host("shopee.co.id"))
+        self.assertFalse(shopeelink._is_short_link_host("shopee.sg"))
+        self.assertFalse(shopeelink._is_short_link_host(""))
 
 
 class ConvertManyTests(unittest.TestCase):

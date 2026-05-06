@@ -43,10 +43,13 @@ class ShopeeLinkError(ValueError):
 
 
 def _build_product_url(host: str, shop_id: str, item_id: str) -> str:
-    host = host or "shopee.co.id"
-    # Shopee short-link host is s.shopee.* — fall back to the main storefront.
-    if host.startswith("s."):
-        host = host[2:]
+    host = (host or "shopee.co.id").lower()
+    # Shopee short-link hosts (s.shopee.*, shp.ee, *.shp.ee) — fall back to the
+    # main shopee.co.id storefront which serves /product/<shop>/<item>.
+    if host.startswith("s.shopee."):
+        host = host[len("s."):]
+    elif host == "shp.ee" or host.endswith(".shp.ee"):
+        host = "shopee.co.id"
     return f"https://{host}/product/{shop_id}/{item_id}"
 
 
@@ -137,11 +140,26 @@ def resolve_short_link(url: str, timeout: float = DEFAULT_TIMEOUT) -> str:
     )
 
 
+def _is_short_link_host(netloc: str) -> bool:
+    """Return True if ``netloc`` looks like a Shopee short-link domain.
+
+    Recognized:
+    - ``s.shopee.<tld>`` (e.g. ``s.shopee.co.id``, ``s.shopee.com.my``)
+    - ``shp.ee`` and any subdomain (e.g. ``id.shp.ee``, ``my.shp.ee``)
+    """
+    host = (netloc or "").split(":", 1)[0].lower()
+    if host.startswith("s."):
+        return True
+    if host == "shp.ee" or host.endswith(".shp.ee"):
+        return True
+    return False
+
+
 def convert(url: str, timeout: float = DEFAULT_TIMEOUT) -> str:
     """Convert any Shopee URL (short or long) to ``/product/SHOP/ITEM`` form.
 
-    Short links (host starts with ``s.``) are resolved by following redirects;
-    long links are parsed locally without network IO.
+    Short links (mis. ``s.shopee.co.id``, ``id.shp.ee``) are resolved by
+    following HTTP redirects; long links are parsed locally without network IO.
     """
     url = url.strip()
     if not url:
@@ -149,7 +167,7 @@ def convert(url: str, timeout: float = DEFAULT_TIMEOUT) -> str:
     if "://" not in url:
         url = "https://" + url
     parsed = urllib.parse.urlparse(url)
-    if parsed.netloc.startswith("s."):
+    if _is_short_link_host(parsed.netloc):
         return resolve_short_link(url, timeout=timeout)
     return convert_to_product_url(url)
 
