@@ -22,8 +22,13 @@ Key design decisions:
   separate from the user's personal Chrome profile.
 * The user logs in **once** in the launched window. The persistent profile
   keeps them logged in for subsequent ``generate()`` calls.
-* Generation runs the fetch inside the page context via ``page.evaluate``,
-  so the request is indistinguishable from one made by the dashboard form.
+* Generation **fills the dashboard form and clicks the real "Buat Link"
+  button**, then captures the GraphQL response off the network. Earlier
+  revisions tried calling the endpoint directly via ``page.evaluate`` —
+  Shopee's anti-bot SAP layer fingerprints fetches that don't originate
+  from a real click handler and either drops them outright or returns
+  ``error 90309999`` with a CAPTCHA challenge. Driving the visible form
+  uses Shopee's own React handlers, which is what the SAP layer trusts.
 
 The module degrades gracefully when Playwright (or Chrome) is not
 installed: ``ensure_browser_available()`` returns a clear error message
@@ -33,13 +38,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
 import sys
 import time
 import urllib.request
-from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from affiliate import (  # re-export the small types so callers only import one module
@@ -158,45 +163,17 @@ def ensure_browser_available() -> Tuple[bool, str]:
     return True, ""
 
 
-@dataclass
-class _GenerateOutcome:
-    """Internal: result of running the in-page fetch."""
+def _chunks(items: List[LinkInput], size: int) -> Iterable[List[LinkInput]]:
+    """Yield successive ``size``-element slices of ``items``.
 
-    status: int
-    body: str
-    needs_login: bool
-
-
-# JavaScript executed inside the dashboard page. Calls the same GraphQL
-# endpoint the form would, but with our payload. Returns the raw response so
-# the Python side can parse it.
-_FETCH_SCRIPT = r"""
-async (payload) => {
-    const csrf = (() => {
-        const m = document.cookie.match(/(?:^|;\s*)csrftoken=([^;]+)/);
-        return m ? decodeURIComponent(m[1]) : null;
-    })();
-    const url = "https://affiliate.shopee.co.id/api/v3/gql?q=batchCustomLink";
-    const headers = {
-        "Content-Type": "application/json;charset=UTF-8",
-        "Accept": "application/json, text/plain, */*",
-    };
-    if (csrf) headers["Csrf-Token"] = csrf;
-    const resp = await fetch(url, {
-        method: "POST",
-        credentials: "include",
-        headers,
-        body: JSON.stringify(payload),
-    });
-    let body;
-    try {
-        body = await resp.text();
-    } catch (e) {
-        body = "(unable to read body: " + e + ")";
-    }
-    return { status: resp.status, body };
-}
-"""
+    Shopee's dashboard textarea allows up to 5 URLs per submit, so we
+    chunk the input to match — submitting more than that would fail
+    client-side validation in the form anyway.
+    """
+    if size <= 0:
+        size = 1
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
 
 
 class BrowserSession:
@@ -521,91 +498,269 @@ class BrowserSession:
         inputs: Iterable[LinkInput],
         timeout_ms: int = DEFAULT_FETCH_TIMEOUT_MS,
     ) -> List[LinkResult]:
-        """Send a batch request from the dashboard page and return results."""
+        """Drive the dashboard form and capture its GraphQL response.
+
+        Earlier revisions called the GraphQL endpoint directly with
+        ``page.evaluate(fetch)``. Shopee's anti-bot SAP layer fingerprints
+        that path (the call doesn't originate from a real click handler)
+        and either rejects the fetch outright or returns ``error 90309999``
+        with a CAPTCHA challenge in the body. Filling the visible form and
+        clicking the real "Buat Link" button makes the request go through
+        Shopee's own React handlers, exactly like a human user — which is
+        what their SAP layer is designed to allow.
+
+        We capture the response off the network (``page.on("response")``)
+        instead of scraping the result UI, so we don't depend on Shopee's
+        result-list DOM staying stable.
+        """
         items = list(inputs)
         if not items:
             return []
         if self._page is None:
             raise AffiliateError("BrowserSession belum di-start().")
 
-        # Make sure we're on the dashboard so the in-page SDK is loaded.
+        self._goto_dashboard_if_needed()
+        results: List[LinkResult] = []
+        # Dashboard textarea hint says "s/d 5 link" — chunk to match.
+        for chunk in _chunks(items, 5):
+            results.extend(self._submit_chunk(chunk, timeout_ms))
+        return results
+
+    def _goto_dashboard_if_needed(self) -> None:
         try:
-            current = self._page.url
+            current = self._page.url  # type: ignore[union-attr]
         except Exception:  # noqa: BLE001
             current = ""
-        if "affiliate.shopee.co.id" not in current or "/login" in current:
+        on_dashboard = (
+            "affiliate.shopee.co.id" in current
+            and "/offer/custom_link" in current
+            and "/login" not in current
+            and "/verify/captcha" not in current
+        )
+        if not on_dashboard:
             try:
-                self._page.goto(DASHBOARD_URL, wait_until="domcontentloaded")
+                self._page.goto(DASHBOARD_URL, wait_until="domcontentloaded")  # type: ignore[union-attr]
             except Exception as e:  # noqa: BLE001
                 raise AffiliateError(
-                    "Gagal membuka halaman dashboard affiliate. Sesi mungkin "
-                    f"sudah kedaluwarsa.\nDetail: {e}"
+                    "Gagal membuka halaman dashboard affiliate. Sesi "
+                    f"mungkin sudah kedaluwarsa.\nDetail: {e}"
                 )
             if not self._dashboard_loaded():
                 raise AffiliateError(
                     "Anda belum login ke affiliate.shopee.co.id. Klik "
                     "'Hubungkan Chrome…' lalu login dulu."
                 )
+        try:
+            self._page.wait_for_load_state("networkidle", timeout=10_000)  # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _submit_chunk(
+        self,
+        chunk: List[LinkInput],
+        timeout_ms: int,
+    ) -> List[LinkResult]:
+        """Fill the dashboard form for one batch and capture its response."""
+        urls = [it.original_link for it in chunk]
+        # Per-chunk tags: the dashboard form has 5 tag inputs that apply
+        # to every URL in the batch, so we use the first item's tags.
+        tags: Dict[int, str] = {}
+        sub_ids = chunk[0].sub_ids if chunk else ()
+        for i, value in enumerate(sub_ids, start=1):
+            if value:
+                tags[i] = str(value)
+
+        # Set up the response capture before we click anything, so we
+        # don't miss the response if it lands faster than we expect.
+        captured: List[Dict[str, Any]] = []
+
+        def _on_response(response: Any) -> None:
             try:
-                self._page.wait_for_load_state("networkidle", timeout=8_000)
+                if "batchCustomLink" not in response.url:
+                    return
+                try:
+                    body: Any = response.json()
+                except Exception:  # noqa: BLE001
+                    try:
+                        body = {"_raw": response.text()[:5000]}
+                    except Exception:  # noqa: BLE001
+                        body = {"_raw": "(unable to read body)"}
+                captured.append(
+                    {
+                        "url": response.url,
+                        "status": int(response.status),
+                        "body": body,
+                    }
+                )
             except Exception:  # noqa: BLE001
                 pass
 
-        payload = build_payload(items)
-        # Run the fetch in the page context so Shopee's anti-bot SDK can
-        # inject X-Sap-Sec and friends. The script returns the raw status
-        # and body; we parse on the Python side so error messages are
-        # consistent with the cookie-replay code path.
+        self._page.on("response", _on_response)  # type: ignore[union-attr]
         try:
-            outcome: Dict[str, Any] = self._page.evaluate(
-                _FETCH_SCRIPT,
-                payload,
-            )
+            self._fill_form(urls, tags)
+            self._click_buat_link()
+            deadline = time.time() + (timeout_ms / 1000.0)
+            while time.time() < deadline and not captured:
+                # Short-circuit if Shopee redirects to its CAPTCHA challenge
+                # — at that point no GraphQL response will ever arrive.
+                try:
+                    cur = self._page.url or ""  # type: ignore[union-attr]
+                except Exception:  # noqa: BLE001
+                    cur = ""
+                if "/verify/captcha" in cur:
+                    raise AffiliateError(
+                        "Shopee meminta verifikasi CAPTCHA.\n\n"
+                        "Selesaikan puzzle di window Chrome yang muncul "
+                        "(geser slider sampai pas), lalu Anda akan kembali "
+                        "ke dashboard. Klik Generate lagi setelah itu.\n\n"
+                        "Tip: kalau CAPTCHA terus muncul, coba browse-"
+                        "browse dulu di dashboard sebentar (klik menu, "
+                        "scroll halaman) sebelum klik Generate — Shopee "
+                        "lebih percaya kalau ada aktivitas user dulu."
+                    )
+                try:
+                    self._page.wait_for_timeout(200)  # type: ignore[union-attr]
+                except Exception:  # noqa: BLE001
+                    time.sleep(0.2)
+            if not captured:
+                raise AffiliateError(
+                    f"Tidak ada response dari Shopee dalam "
+                    f"{timeout_ms / 1000:.0f} detik. Coba klik Generate "
+                    "ulang. Kalau tetap kosong, refresh halaman Chrome "
+                    "(F5) dan coba lagi."
+                )
+        finally:
+            try:
+                self._page.remove_listener("response", _on_response)  # type: ignore[union-attr]
+            except Exception:  # noqa: BLE001
+                pass
+
+        last = captured[-1]
+        return self._parse_chunk_response(chunk, last)
+
+    def _fill_form(self, urls: List[str], tags: Dict[int, str]) -> None:
+        """Fill the URL textarea and the (up to) 5 tag inputs."""
+        page = self._page  # type: ignore[assignment]
+        textarea = page.locator("textarea").first
+        try:
+            textarea.wait_for(state="visible", timeout=15_000)
         except Exception as e:  # noqa: BLE001
             raise AffiliateError(
-                "Gagal menjalankan request di halaman dashboard.\n"
-                f"Detail: {e}"
+                "Tidak menemukan kolom URL di dashboard. Pastikan halaman "
+                "yang terbuka adalah affiliate.shopee.co.id/offer/custom_link "
+                "dan Anda sudah login.\n\nDetail: " + str(e)
             )
+        textarea.click()
+        try:
+            textarea.fill("")
+        except Exception:  # noqa: BLE001
+            pass
+        textarea.fill("\n".join(urls))
 
-        status = int(outcome.get("status") or 0)
-        body = str(outcome.get("body") or "")
-        debug_path = _save_debug(payload, status, body)
+        tag_inputs = page.locator('input[placeholder*="Contoh"]')
+        try:
+            count = tag_inputs.count()
+        except Exception:  # noqa: BLE001
+            count = 0
+        for i in range(min(count, 5)):
+            value = tags.get(i + 1, "")
+            inp = tag_inputs.nth(i)
+            try:
+                inp.click()
+                inp.fill(value)
+            except Exception:  # noqa: BLE001
+                # Tag inputs are optional — if one fails to fill we just
+                # carry on; the user can retry.
+                pass
+
+    def _click_buat_link(self) -> None:
+        page = self._page  # type: ignore[assignment]
+        # Try a couple of selectors so we tolerate small UI changes.
+        selectors = [
+            ('role="button" name=/buat\\s*link/i', lambda p: p.get_by_role(
+                "button", name=re.compile(r"buat\s*link", re.I)
+            )),
+            ('button:has-text("Buat Link")', lambda p: p.locator(
+                'button:has-text("Buat Link")'
+            )),
+        ]
+        last_err: Optional[Exception] = None
+        for desc, fn in selectors:
+            try:
+                btn = fn(page).first
+                btn.wait_for(state="visible", timeout=8_000)
+                btn.click()
+                return
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                continue
+        raise AffiliateError(
+            "Tombol 'Buat Link' tidak ditemukan di dashboard.\n\n"
+            "Detail: " + (str(last_err) if last_err else "tidak diketahui")
+        )
+
+    def _parse_chunk_response(
+        self,
+        chunk: List[LinkInput],
+        captured: Dict[str, Any],
+    ) -> List[LinkResult]:
+        status = int(captured.get("status") or 0)
+        body = captured.get("body")
+        debug_path = _save_debug(
+            build_payload(chunk),
+            status,
+            json.dumps(body, ensure_ascii=False)[:8000]
+            if isinstance(body, dict)
+            else str(body),
+        )
 
         if status >= 400:
             raise AffiliateError(
                 f"HTTP {status} dari Shopee.\n\n"
                 "Sesi browser mungkin kedaluwarsa — klik 'Hubungkan "
                 "Chrome…' dan login ulang.\n\n"
-                f"Response sample:\n{body[:500] or '(empty body)'}\n\n"
-                f"(disimpan di {debug_path})"
+                f"Response sample:\n{json.dumps(body, ensure_ascii=False)[:500]}"
+                f"\n\n(disimpan di {debug_path})"
             )
-
-        try:
-            data = json.loads(body) if body else None
-        except json.JSONDecodeError:
+        if not isinstance(body, dict):
             raise AffiliateError(
-                "Response Shopee bukan JSON valid.\n\n"
-                f"Response sample:\n{body[:500] or '(empty body)'}\n\n"
+                "Response Shopee tidak bisa di-parse.\n\n"
+                f"Response sample:\n{str(body)[:500]}\n\n"
                 f"(disimpan di {debug_path})"
             )
 
-        if isinstance(data, dict) and data.get("errors"):
+        # Anti-bot rejection format (see Shopee SAP layer):
+        # {"error": 90309999, "data": {"batchCustomLink": null}, ...}
+        err_code = body.get("error")
+        if isinstance(err_code, int) and err_code != 0:
+            raise AffiliateError(
+                f"Shopee menolak request (anti-bot, error {err_code}).\n\n"
+                "Coba langkah ini:\n"
+                "  1. Di window Chrome yang terbuka, browse-browse "
+                "sebentar — klik menu, scroll, lihat-lihat. Risk engine "
+                "Shopee lebih percaya session yang aktif.\n"
+                "  2. Tunggu 1-2 menit, lalu klik Generate lagi.\n"
+                "  3. Kalau masih, klik 'Hubungkan Chrome…' lagi → "
+                "login ulang dengan Reset profile dulu.\n\n"
+                f"Response sample:\n{json.dumps(body, ensure_ascii=False)[:500]}"
+                f"\n\n(disimpan di {debug_path})"
+            )
+        if body.get("errors"):
             msgs = "; ".join(
-                str(err.get("message", err)) for err in data["errors"]
+                str(err.get("message", err)) for err in body["errors"]
             )
             raise AffiliateError(f"GraphQL errors: {msgs}")
 
-        batch = ((data or {}).get("data") or {}).get("batchCustomLink") or []
+        batch = ((body or {}).get("data") or {}).get("batchCustomLink") or []
         if not batch:
             raise AffiliateError(
                 "Shopee mengembalikan response sukses tapi data kosong. "
-                "Coba klik 'Hubungkan Chrome…' lalu refresh halaman, "
-                "kemudian Generate ulang.\n\n"
-                f"Response sample:\n{body[:500] or '(empty body)'}\n\n"
-                f"(disimpan di {debug_path})"
+                "Coba klik 'Hubungkan Chrome…' → Reset profile → login "
+                "ulang, lalu Generate ulang.\n\n"
+                f"Response sample:\n{json.dumps(body, ensure_ascii=False)[:500]}"
+                f"\n\n(disimpan di {debug_path})"
             )
-
-        return _build_results(items, batch)
+        return _build_results(chunk, batch)
 
 
 def _save_debug(payload: Dict[str, Any], status: int, body: str) -> str:

@@ -14,24 +14,95 @@ import affiliate
 import affiliate_browser as ab
 
 
+class _FakeResponse:
+    """Stand-in for ``playwright.sync_api.Response`` passed to handlers."""
+
+    def __init__(self, url, status, payload):
+        self.url = url
+        self.status = status
+        self._payload = payload
+
+    def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
+
+    def text(self):
+        return json.dumps(self._payload)
+
+
+class _FakeLocator:
+    """Stand-in for ``playwright.sync_api.Locator``.
+
+    The fake supports ``first/.nth/.count/.wait_for/.click/.fill`` — the
+    handful of Locator methods the production code actually calls. A
+    ``button``-kind locator triggers the page's response handler when
+    clicked, which is what the dashboard's "Buat Link" button does in
+    real life (it fires the GraphQL request that we capture).
+    """
+
+    def __init__(self, page, kind, count=1):
+        self.page = page
+        self.kind = kind
+        self._count = count
+
+    @property
+    def first(self):
+        return self
+
+    def nth(self, i):
+        return self
+
+    def count(self):
+        return self._count
+
+    def wait_for(self, **kwargs):
+        return None
+
+    def click(self, **kwargs):
+        if self.kind == "button":
+            self.page._fire_response()
+
+    def fill(self, value):
+        if self.kind == "textarea":
+            self.page.textarea_value = value
+        elif self.kind == "tag_input":
+            self.page.tag_inputs.append(value)
+
+
 class _FakePage:
-    """Minimal stand-in for ``playwright.sync_api.Page``."""
+    """Minimal stand-in for ``playwright.sync_api.Page``.
+
+    Supports the surface area the production code touches: ``goto``,
+    ``wait_for_load_state``, ``evaluate`` (only for the DOM-based login
+    probe), ``locator``, ``get_by_role``, ``on``/``remove_listener``,
+    ``wait_for_timeout``. Form clicks fire a synthetic GraphQL response
+    so the polling loop in ``_submit_chunk`` exits cleanly.
+    """
 
     def __init__(
         self,
         navigations=None,
-        evaluate_result=None,
-        evaluate_error=None,
         has_login_form=False,
+        response_payload=None,
+        response_status=200,
+        response_url="https://affiliate.shopee.co.id/api/v3/gql?q=batchCustomLink",
+        captcha_after_click=False,
     ):
         self.url = ""
         self._navigations = list(navigations or [])
-        self._evaluate_result = evaluate_result
-        self._evaluate_error = evaluate_error
         # Whether the page currently contains an input[type=password] (used
         # by the new DOM-based login detector).
         self.has_login_form = has_login_form
         self.evaluate_calls: list = []
+        self.textarea_value = ""
+        self.tag_inputs: list = []
+        self._listeners: dict = {}
+        self._response_payload = response_payload
+        self._response_status = response_status
+        self._response_url = response_url
+        self._captcha_after_click = captcha_after_click
+        self._fired = False
 
     # --- navigation -------------------------------------------------------
 
@@ -46,24 +117,66 @@ class _FakePage:
     def wait_for_load_state(self, state="load", timeout=None):
         return None
 
+    def wait_for_timeout(self, ms):
+        return None
+
     def set_default_navigation_timeout(self, ms):
         pass
 
     def set_default_timeout(self, ms):
         pass
 
-    # --- evaluate ---------------------------------------------------------
+    # --- evaluate (used only by the login-form DOM probe) ----------------
 
     def evaluate(self, script, payload=None):
         self.evaluate_calls.append((script, payload))
-        if self._evaluate_error:
-            raise self._evaluate_error
-        # The DOM-based login probe is a tiny inline arrow function. If we
-        # see it, answer based on ``has_login_form`` instead of returning
-        # the canned fetch result.
         if isinstance(script, str) and 'input[type="password"]' in script:
             return self.has_login_form
-        return self._evaluate_result
+        return None
+
+    # --- locators ---------------------------------------------------------
+
+    def locator(self, selector):
+        if "textarea" in selector:
+            return _FakeLocator(self, "textarea")
+        if "Contoh" in selector:
+            return _FakeLocator(self, "tag_input", count=5)
+        # Anything else (including button:has-text(...)) → button locator.
+        return _FakeLocator(self, "button")
+
+    def get_by_role(self, role, name=None):
+        if role == "button":
+            return _FakeLocator(self, "button")
+        return _FakeLocator(self, "unknown")
+
+    # --- event listeners --------------------------------------------------
+
+    def on(self, event, handler):
+        self._listeners.setdefault(event, []).append(handler)
+
+    def remove_listener(self, event, handler):
+        if event in self._listeners:
+            try:
+                self._listeners[event].remove(handler)
+            except ValueError:
+                pass
+
+    def _fire_response(self):
+        """Simulate Shopee's React code calling the GraphQL endpoint after
+        the user clicks "Buat Link"."""
+        if self._captcha_after_click:
+            self.url = (
+                "https://shopee.co.id/verify/captcha?anti_bot_tracking_id=xyz"
+            )
+            return
+        if self._fired or self._response_payload is None:
+            return
+        self._fired = True
+        resp = _FakeResponse(
+            self._response_url, self._response_status, self._response_payload
+        )
+        for handler in list(self._listeners.get("response", [])):
+            handler(resp)
 
 
 class EnsureBrowserAvailableTests(unittest.TestCase):
@@ -123,14 +236,22 @@ class DashboardLoadedTests(unittest.TestCase):
 
 
 class GenerateTests(unittest.TestCase):
+    """Cover the form-automation path used by ``BrowserSession.generate``.
+
+    The production code fills the dashboard's textarea + tag inputs and
+    clicks the real "Buat Link" button. The fake page fires a synthetic
+    GraphQL response on click so we can exercise success and failure
+    branches without launching a browser.
+    """
+
     def _bs(self, page: _FakePage) -> ab.BrowserSession:
         bs = ab.BrowserSession.__new__(ab.BrowserSession)
         bs._page = page
         return bs
 
     def test_generates_links_when_response_ok(self) -> None:
-        body = json.dumps(
-            {
+        page = _FakePage(
+            response_payload={
                 "data": {
                     "batchCustomLink": [
                         {
@@ -140,46 +261,54 @@ class GenerateTests(unittest.TestCase):
                         }
                     ]
                 }
-            }
+            },
         )
-        page = _FakePage(evaluate_result={"status": 200, "body": body})
         page.url = "https://affiliate.shopee.co.id/offer/custom_link"
         bs = self._bs(page)
         with tempfile.TemporaryDirectory() as d, mock.patch.object(
             ab, "user_data_dir", return_value=d
         ):
             results = bs.generate(
-                [affiliate.LinkInput(original_link="https://shopee.co.id/product/1/2")]
+                [
+                    affiliate.LinkInput(
+                        original_link="https://shopee.co.id/product/1/2",
+                        sub_ids=("PF1", "", "", "", ""),
+                    )
+                ]
             )
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].short_link, "https://s.shopee.co.id/AAA")
         self.assertTrue(results[0].ok)
-        # The script should have been evaluated once with our payload.
-        self.assertEqual(len(page.evaluate_calls), 1)
-        _script, payload = page.evaluate_calls[0]
-        self.assertEqual(
-            payload["variables"]["linkParams"][0]["originalLink"],
-            "https://shopee.co.id/product/1/2",
+        # We filled the textarea with the URL and at least one tag.
+        self.assertIn(
+            "https://shopee.co.id/product/1/2", page.textarea_value
         )
+        self.assertIn("PF1", page.tag_inputs)
 
     def test_navigates_to_dashboard_when_not_already_there(self) -> None:
-        body = json.dumps({"data": {"batchCustomLink": [{"shortLink": "https://s/X"}]}})
-        # Start on a different URL; goto() will set us back to the dashboard.
         page = _FakePage(
             navigations=["https://affiliate.shopee.co.id/offer/custom_link"],
-            evaluate_result={"status": 200, "body": body},
+            response_payload={
+                "data": {"batchCustomLink": [{"shortLink": "https://s/X"}]}
+            },
         )
         page.url = "about:blank"
         bs = self._bs(page)
         with tempfile.TemporaryDirectory() as d, mock.patch.object(
             ab, "user_data_dir", return_value=d
         ):
-            bs.generate([affiliate.LinkInput(original_link="https://shopee.co.id/product/1/2")])
-        # We should have navigated.
-        self.assertEqual(page.url, "https://affiliate.shopee.co.id/offer/custom_link")
+            bs.generate(
+                [affiliate.LinkInput(original_link="https://shopee.co.id/product/1/2")]
+            )
+        self.assertEqual(
+            page.url, "https://affiliate.shopee.co.id/offer/custom_link"
+        )
 
     def test_raises_on_http_error_with_response_sample(self) -> None:
-        page = _FakePage(evaluate_result={"status": 403, "body": '{"error":90309999}'})
+        page = _FakePage(
+            response_payload={"error": 90309999},
+            response_status=403,
+        )
         page.url = "https://affiliate.shopee.co.id/offer/custom_link"
         bs = self._bs(page)
         with tempfile.TemporaryDirectory() as d, mock.patch.object(
@@ -193,8 +322,15 @@ class GenerateTests(unittest.TestCase):
         self.assertIn("HTTP 403", str(ctx.exception))
         self.assertIn("90309999", str(ctx.exception))
 
-    def test_raises_when_response_not_json(self) -> None:
-        page = _FakePage(evaluate_result={"status": 200, "body": "<html>oops</html>"})
+    def test_raises_on_anti_bot_error_code(self) -> None:
+        # Shopee's anti-bot rejection format: 200 OK but body contains
+        # ``error: 90309999`` plus a CAPTCHA challenge payload.
+        page = _FakePage(
+            response_payload={
+                "error": 90309999,
+                "data": {"batchCustomLink": None},
+            },
+        )
         page.url = "https://affiliate.shopee.co.id/offer/custom_link"
         bs = self._bs(page)
         with tempfile.TemporaryDirectory() as d, mock.patch.object(
@@ -204,15 +340,21 @@ class GenerateTests(unittest.TestCase):
                 bs.generate(
                     [affiliate.LinkInput(original_link="https://shopee.co.id/product/1/2")]
                 )
-        self.assertIn("bukan JSON valid", str(ctx.exception))
+        self.assertIn("anti-bot", str(ctx.exception).lower())
+        self.assertIn("90309999", str(ctx.exception))
+
+    def test_raises_on_captcha_redirect(self) -> None:
+        page = _FakePage(captcha_after_click=True)
+        page.url = "https://affiliate.shopee.co.id/offer/custom_link"
+        bs = self._bs(page)
+        with self.assertRaises(affiliate.AffiliateError) as ctx:
+            bs.generate(
+                [affiliate.LinkInput(original_link="https://shopee.co.id/product/1/2")]
+            )
+        self.assertIn("CAPTCHA", str(ctx.exception))
 
     def test_raises_when_batch_empty(self) -> None:
-        page = _FakePage(
-            evaluate_result={
-                "status": 200,
-                "body": json.dumps({"data": {"batchCustomLink": []}}),
-            }
-        )
+        page = _FakePage(response_payload={"data": {"batchCustomLink": []}})
         page.url = "https://affiliate.shopee.co.id/offer/custom_link"
         bs = self._bs(page)
         with tempfile.TemporaryDirectory() as d, mock.patch.object(
@@ -225,7 +367,7 @@ class GenerateTests(unittest.TestCase):
 
     def test_raises_when_not_logged_in(self) -> None:
         # goto() lands us on a login URL; generate() should refuse to even
-        # call evaluate.
+        # touch the form.
         page = _FakePage(
             navigations=["https://affiliate.shopee.co.id/login?redirect_url=..."],
         )
@@ -236,7 +378,8 @@ class GenerateTests(unittest.TestCase):
                 [affiliate.LinkInput(original_link="https://shopee.co.id/product/1/2")]
             )
         self.assertIn("Hubungkan Chrome", str(ctx.exception))
-        self.assertEqual(page.evaluate_calls, [])  # never even tried fetch
+        # Form was never touched (textarea stays empty).
+        self.assertEqual(page.textarea_value, "")
 
 
 class WaitForLoginTests(unittest.TestCase):
