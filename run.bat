@@ -23,6 +23,10 @@ if not exist "%PYEXE%" (
     "%PYEXE%" -m pip install -r requirements.txt || goto :fail
 )
 
+REM Make sure new dependencies (e.g. playwright in v1.3.0) are installed even
+REM if the venv was created by an older release.
+"%PYEXE%" -m pip install -r requirements.txt --quiet --disable-pip-version-check || goto :fail
+
 start "" "%VENV_DIR%\Scripts\pythonw.exe" shopeelink_gui.py
 exit /b 0
 

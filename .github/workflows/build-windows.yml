@@ -24,11 +24,16 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      # Playwright needs its driver & Node launcher bundled. We *don't* run
+      # `playwright install chromium` because we launch the user's installed
+      # Chrome via channel="chrome" — that saves ~150 MB in the .exe.
       - name: Build single-file Windows GUI executable
         run: |
           pyinstaller --noconfirm --onefile --windowed `
             --name "ShopeeLinkConverter" `
             --collect-all customtkinter `
+            --collect-all playwright `
+            --collect-binaries playwright `
             shopeelink_gui.py
 
       - name: Show build output
