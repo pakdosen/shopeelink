@@ -41,7 +41,7 @@ import tkinter as tk  # noqa: E402
 from tkinter import messagebox, ttk  # noqa: E402
 
 APP_TITLE = "Shopee Link Converter"
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 DEFAULT_TIMEOUT = 15.0
 RESULT_POLL_MS = 80
 # How long the "Hubungkan Chrome" worker waits for the user to log in.

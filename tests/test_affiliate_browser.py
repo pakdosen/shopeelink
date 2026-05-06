@@ -282,5 +282,33 @@ class ProfileSummaryTests(unittest.TestCase):
         self.assertIn("Belum ada profile", summary)
 
 
+class FindChromeExecutableTests(unittest.TestCase):
+    def test_env_override_takes_priority(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as fake:
+            fake_path = fake.name
+        try:
+            with mock.patch.dict(os.environ, {"SHOPEELINK_CHROME_PATH": fake_path}):
+                self.assertEqual(ab.find_chrome_executable(), fake_path)
+        finally:
+            os.unlink(fake_path)
+
+    def test_returns_none_when_env_var_points_to_missing_file(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"SHOPEELINK_CHROME_PATH": "/definitely/not/a/real/path/chrome.exe"},
+        ):
+            with mock.patch.object(ab.shutil, "which", return_value=None):
+                with mock.patch.object(ab.os.path, "isfile", return_value=False):
+                    self.assertIsNone(ab.find_chrome_executable())
+
+
+class FindFreePortTests(unittest.TestCase):
+    def test_returns_an_int_in_valid_range(self) -> None:
+        port = ab._find_free_port()
+        self.assertIsInstance(port, int)
+        self.assertGreater(port, 0)
+        self.assertLessEqual(port, 65535)
+
+
 if __name__ == "__main__":
     unittest.main()
