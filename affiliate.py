@@ -19,6 +19,7 @@ directory.
 """
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import platform
@@ -26,6 +27,7 @@ import shlex
 import sys
 import urllib.error
 import urllib.request
+import zlib
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -35,6 +37,11 @@ GQL_ENDPOINT = (
 SOURCE_CALLER = "CUSTOM_LINK_CALLER"
 DEFAULT_TIMEOUT = 30.0
 MAX_SUB_IDS = 5
+
+# Headers that look like Shopee's anti-bot signatures. They are likely tied to
+# a specific request body so cannot be reused. We strip them on retry.
+_ANTIBOT_HEADER_PREFIXES = ("x-sap-", "af-ac-")
+_ANTIBOT_HEADER_NAMES = {"x-sz-sdk-version"}
 
 # GraphQL query exactly as the dashboard sends it, so the server treats us as
 # an ordinary client.
@@ -343,57 +350,183 @@ def build_payload(items: Iterable[LinkInput]) -> Dict[str, Any]:
     }
 
 
-def generate_short_links(
-    inputs: Iterable[LinkInput],
-    session: Session,
-    timeout: float = DEFAULT_TIMEOUT,
-) -> List[LinkResult]:
-    """Send one batch request and return one ``LinkResult`` per input."""
-    items = list(inputs)
-    if not items:
-        return []
-    payload = build_payload(items)
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+def _strip_antibot_headers(headers: Dict[str, str]) -> Dict[str, str]:
+    """Return a copy of ``headers`` without Shopee's anti-bot signature headers."""
+    out: Dict[str, str] = {}
+    for k, v in headers.items():
+        lk = k.lower()
+        if lk in _ANTIBOT_HEADER_NAMES:
+            continue
+        if any(lk.startswith(p) for p in _ANTIBOT_HEADER_PREFIXES):
+            continue
+        out[k] = v
+    return out
 
-    headers = dict(session.headers)
-    headers.setdefault("Content-Type", "application/json; charset=UTF-8")
-    headers.setdefault("Accept", "application/json, text/plain, */*")
-    if session.csrf_token and not _header_get(headers, "Csrf-Token"):
-        headers["Csrf-Token"] = session.csrf_token
 
+def _decode_body(raw: bytes, content_encoding: Optional[str]) -> str:
+    """Decompress ``raw`` based on ``content_encoding`` and decode to text."""
+    if not raw:
+        return ""
+    enc = (content_encoding or "").lower().strip()
+    try:
+        if enc == "gzip":
+            raw = gzip.decompress(raw)
+        elif enc == "deflate":
+            try:
+                raw = zlib.decompress(raw)
+            except zlib.error:
+                raw = zlib.decompress(raw, -zlib.MAX_WBITS)
+        elif enc == "br":
+            try:
+                import brotli  # type: ignore[import-not-found]
+                raw = brotli.decompress(raw)
+            except Exception:  # noqa: BLE001
+                # No brotli available; leave bytes as-is and let the caller fail.
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    return raw.decode("utf-8", errors="replace")
+
+
+def _save_debug(payload: Dict[str, Any], headers: Dict[str, str], status: int, body: str) -> str:
+    """Save the most recent request/response pair for troubleshooting."""
+    safe_headers = {
+        k: ("<redacted>" if k.lower() in ("cookie", "csrf-token", "x-csrf-token") else v)
+        for k, v in headers.items()
+    }
+    record = {
+        "request": {"url": GQL_ENDPOINT, "headers": safe_headers, "payload": payload},
+        "response": {"status": status, "body": body[:8000]},
+    }
+    path = os.path.join(user_data_dir(), "last_response.json")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2, ensure_ascii=False)
+    except OSError:
+        pass
+    return path
+
+
+def _do_request(
+    body: bytes, headers: Dict[str, str], timeout: float
+) -> Tuple[int, Dict[str, str], str]:
+    """Single POST attempt. Returns (status, response_headers, decoded_body)."""
     req = urllib.request.Request(
         GQL_ENDPOINT, data=body, method="POST", headers=headers
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec
             raw = resp.read()
+            resp_headers = {k: v for k, v in resp.headers.items()}
+            status = resp.status
     except urllib.error.HTTPError as e:
+        raw = b""
         try:
-            detail = e.read().decode("utf-8", errors="replace")
+            raw = e.read()
         except Exception:  # noqa: BLE001
-            detail = ""
-        raise AffiliateError(
-            f"HTTP {e.code} dari Shopee. Sesi mungkin sudah kedaluwarsa — "
-            f"refresh dengan Import cURL terbaru.\nDetail: {detail[:300]}"
-        )
-    except urllib.error.URLError as e:
-        raise AffiliateError(f"Gagal connect ke Shopee: {e.reason}")
+            pass
+        resp_headers = {k: v for k, v in e.headers.items()} if e.headers else {}
+        status = e.code
+    text = _decode_body(raw, resp_headers.get("Content-Encoding") or resp_headers.get("content-encoding"))
+    return status, resp_headers, text
 
-    try:
-        data = json.loads(raw.decode("utf-8", errors="replace"))
-    except json.JSONDecodeError as e:
-        raise AffiliateError(f"Response Shopee bukan JSON valid: {e}")
 
-    if "errors" in data and data["errors"]:
-        msgs = "; ".join(str(err.get("message", err)) for err in data["errors"])
-        raise AffiliateError(f"GraphQL errors: {msgs}")
+def generate_short_links(
+    inputs: Iterable[LinkInput],
+    session: Session,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> List[LinkResult]:
+    """Send a batch request and return one ``LinkResult`` per input.
 
-    batch = (data.get("data") or {}).get("batchCustomLink") or []
+    Strategy:
+    1. First try with **full** captured headers (including Shopee anti-bot
+       signatures) since they may be session-bound.
+    2. If that returns an empty batch (silent rejection — common anti-bot
+       pattern), retry **without** the anti-bot headers, in case they were
+       request-bound and replaying them was actually the problem.
+    3. If both return empty, raise with the raw response sample so the user
+       can paste it back to us for debugging.
+    """
+    items = list(inputs)
+    if not items:
+        return []
+    payload = build_payload(items)
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    base_headers = dict(session.headers)
+    base_headers.setdefault("Content-Type", "application/json; charset=UTF-8")
+    base_headers.setdefault("Accept", "application/json, text/plain, */*")
+    # Force identity encoding so we don't have to handle every codec.
+    base_headers["Accept-Encoding"] = "identity"
+    if session.csrf_token and not _header_get(base_headers, "Csrf-Token"):
+        base_headers["Csrf-Token"] = session.csrf_token
+
+    attempts: List[Tuple[str, Dict[str, str]]] = [
+        ("full", base_headers),
+        ("no-antibot", _strip_antibot_headers(base_headers)),
+    ]
+
+    last_status = 0
+    last_body = ""
+    last_headers: Dict[str, str] = {}
+    for label, headers in attempts:
+        try:
+            status, _, text = _do_request(body, headers, timeout)
+        except urllib.error.URLError as e:
+            raise AffiliateError(f"Gagal connect ke Shopee: {e.reason}")
+        last_status, last_body, last_headers = status, text, headers
+
+        if status >= 400:
+            # No point retrying on the no-antibot attempt with the same auth.
+            _save_debug(payload, headers, status, text)
+            raise AffiliateError(
+                f"HTTP {status} dari Shopee (attempt={label}). "
+                "Sesi mungkin sudah kedaluwarsa — refresh dengan Import cURL "
+                "terbaru.\n\nResponse:\n" + (text[:500] or "(empty body)")
+            )
+
+        try:
+            data = json.loads(text) if text else None
+        except json.JSONDecodeError:
+            _save_debug(payload, headers, status, text)
+            raise AffiliateError(
+                f"Response Shopee bukan JSON valid (attempt={label}).\n\n"
+                "Response sample:\n" + (text[:500] or "(empty body)")
+            )
+
+        if isinstance(data, dict) and data.get("errors"):
+            msgs = "; ".join(
+                str(err.get("message", err)) for err in data["errors"]
+            )
+            _save_debug(payload, headers, status, text)
+            raise AffiliateError(f"GraphQL errors (attempt={label}): {msgs}")
+
+        batch = ((data or {}).get("data") or {}).get("batchCustomLink") or []
+        if batch:
+            return _build_results(items, batch)
+        # Empty batch; try the next attempt.
+
+    debug_path = _save_debug(payload, last_headers, last_status, last_body)
+    raise AffiliateError(
+        "Shopee mengembalikan response sukses (HTTP "
+        f"{last_status}) tapi batch kosong di kedua attempt (full + "
+        "no-antibot). Kemungkinan:\n"
+        " • Sesi tertolak oleh anti-bot (silent reject)\n"
+        " • Atau format payload berubah sejak terakhir di-capture\n\n"
+        f"Raw response disimpan di: {debug_path}\n\n"
+        "Response sample:\n" + (last_body[:600] or "(empty body)")
+    )
+
+
+def _build_results(items: List[LinkInput], batch: List[Any]) -> List[LinkResult]:
     results: List[LinkResult] = []
     for item, raw_result in zip(items, batch):
         if not isinstance(raw_result, dict):
             results.append(
-                LinkResult(original_link=item.original_link, error="Empty response item")
+                LinkResult(
+                    original_link=item.original_link,
+                    error="Empty response item",
+                )
             )
             continue
         results.append(
@@ -404,7 +537,6 @@ def generate_short_links(
                 fail_code=int(raw_result.get("failCode") or 0),
             )
         )
-    # If Shopee returned fewer items than we sent, fill the rest with errors.
     for missing in items[len(results):]:
         results.append(
             LinkResult(
