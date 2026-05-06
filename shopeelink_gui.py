@@ -38,7 +38,7 @@ import tkinter as tk  # noqa: E402
 from tkinter import messagebox, ttk  # noqa: E402
 
 APP_TITLE = "Shopee Link Converter"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 DEFAULT_TIMEOUT = 15.0
 RESULT_POLL_MS = 80
 
