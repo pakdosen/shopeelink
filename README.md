@@ -9,7 +9,14 @@ banyak link sekaligus, lewat **aplikasi desktop GUI** atau **CLI**.
 ```
 Input  : https://s.shopee.co.id/1VvkmRGQgz
 Output : https://shopee.co.id/product/2637287/23082544058
+
+Input  : https://id.shp.ee/keK2a57R
+Output : https://shopee.co.id/product/270387150/25170072348
 ```
+
+Format pendek yang didukung:
+- `s.shopee.co.id/...`, `s.shopee.com.my/...`, dst.
+- `id.shp.ee/...`, `my.shp.ee/...`, atau `shp.ee/...`
 
 ## Aplikasi Desktop (GUI) — paling mudah
 
