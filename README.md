@@ -29,10 +29,11 @@ Tag      : PF1
 Output   : https://s.shopee.co.id/901ojkZNEU
 ```
 
-> Generate link membutuhkan akun Shopee Affiliate Anda. Tool men-drive Chrome
-> Anda sendiri (via Playwright dengan `channel="chrome"` — Chromium tidak
-> di-download terpisah). Anda login sekali di window Chrome khusus shopeelink,
-> lalu Generate berikutnya tinggal klik. Lihat
+> Generate link membutuhkan akun Shopee Affiliate Anda. Tool launch Chrome
+> Anda sendiri (subprocess + CDP, **bukan** Playwright launcher) supaya
+> Shopee tidak deteksi sebagai automation. Chromium tidak di-download
+> terpisah. Anda login sekali di window Chrome khusus shopeelink, lalu
+> Generate berikutnya tinggal klik. Lihat
 > [Tab "Generate Affiliate Link"](#tab-generate-affiliate-link).
 
 ## Aplikasi Desktop (GUI) — paling mudah

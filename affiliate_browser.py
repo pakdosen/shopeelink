@@ -3,20 +3,25 @@
 
 This module replaces the cookie-replay strategy in ``affiliate.py``: instead
 of trying to forward captured headers (which Shopee's anti-bot SDK rejects),
-we drive the user's installed Chrome via Playwright and call the
-``batchCustomLink`` GraphQL endpoint **from inside the loaded affiliate
-dashboard page**. The browser's own JavaScript runtime computes the
-``X-Sap-Sec`` HMAC signature for us, so Shopee accepts the request.
+we drive the user's installed Chrome and call the ``batchCustomLink``
+GraphQL endpoint **from inside the loaded affiliate dashboard page**. The
+browser's own JavaScript runtime computes the ``X-Sap-Sec`` HMAC
+signature for us, so Shopee accepts the request.
 
 Key design decisions:
 
-* Uses Playwright's ``launch_persistent_context`` with ``channel="chrome"``
-  so we re-use the user's installed Chrome (no extra ~150 MB Chromium
-  download).
+* We do **not** call ``playwright.chromium.launch_persistent_context``.
+  Playwright's launcher adds several automation flags (``--enable-automation``
+  among them) that Shopee's anti-bot system fingerprints and routes to a
+  CAPTCHA challenge that itself refuses to render to detected automation.
+  So we ``subprocess.Popen`` the user's installed Chrome **ourselves** with
+  only ``--remote-debugging-port`` and ``--user-data-dir``, then attach
+  Playwright via ``connect_over_cdp``. Chrome looks identical to one a
+  human just double-clicked — no infobar, no ``navigator.webdriver``.
 * The browser profile lives in ``<user_data_dir>/chrome-profile`` — fully
   separate from the user's personal Chrome profile.
-* The user logs in **once** in a visible browser window. The persistent
-  profile keeps them logged in for subsequent ``generate()`` calls.
+* The user logs in **once** in the launched window. The persistent profile
+  keeps them logged in for subsequent ``generate()`` calls.
 * Generation runs the fetch inside the page context via ``page.evaluate``,
   so the request is indistinguishable from one made by the dashboard form.
 
@@ -29,7 +34,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
+import subprocess
 import sys
+import time
+import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -44,7 +53,7 @@ from affiliate import (  # re-export the small types so callers only import one 
 
 DASHBOARD_URL = "https://affiliate.shopee.co.id/offer/custom_link"
 LOGIN_URL = "https://affiliate.shopee.co.id"
-DEFAULT_LAUNCH_TIMEOUT_MS = 30_000
+DEFAULT_LAUNCH_TIMEOUT_S = 30
 DEFAULT_NAV_TIMEOUT_MS = 30_000
 DEFAULT_FETCH_TIMEOUT_MS = 60_000
 
@@ -56,6 +65,8 @@ __all__ = [
     "BrowserSession",
     "ensure_browser_available",
     "chrome_profile_dir",
+    "reset_profile",
+    "profile_summary",
 ]
 
 
@@ -66,8 +77,61 @@ def chrome_profile_dir() -> str:
     return path
 
 
+def find_chrome_executable() -> Optional[str]:
+    """Locate the user's installed Chrome (or an env override).
+
+    Order:
+
+    1. ``SHOPEELINK_CHROME_PATH`` environment variable (escape hatch for
+       non-standard installations).
+    2. Per-OS standard installation paths.
+    3. ``shutil.which`` for ``chrome`` / ``google-chrome`` / etc.
+
+    Returns ``None`` if Chrome cannot be located.
+    """
+    env = os.environ.get("SHOPEELINK_CHROME_PATH")
+    if env and os.path.isfile(env):
+        return env
+    if sys.platform == "win32":
+        candidates = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        ]
+    elif sys.platform == "darwin":
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            os.path.expanduser(
+                "~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            ),
+        ]
+    else:
+        candidates = [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/snap/bin/google-chrome",
+            "/snap/bin/chromium",
+        ]
+    for c in candidates:
+        if c and os.path.isfile(c):
+            return c
+    for name in ("chrome", "google-chrome", "google-chrome-stable", "chromium"):
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
 def ensure_browser_available() -> Tuple[bool, str]:
-    """Check whether Playwright + a Chrome channel are available.
+    """Check whether Playwright + Chrome are available.
 
     Returns ``(ok, message)``. ``message`` is empty on success; otherwise it
     contains a user-facing explanation of how to install the missing piece.
@@ -81,12 +145,16 @@ def ensure_browser_available() -> Tuple[bool, str]:
             "  • Kalau Anda jalan dari source: tutup aplikasi, hapus folder "
             "'.venv', lalu klik 'run.bat' / 'run.sh' lagi (auto-install).\n"
             "  • Kalau dari .exe: download .exe versi terbaru "
-            "(v1.3.0 ke atas)."
+            "(v1.3.2 ke atas)."
         )
-
-    # Channel "chrome" needs the user to have Google Chrome installed. We
-    # don't validate the binary path here (Playwright searches standard
-    # locations); we just give a friendly message if launch fails later.
+    if find_chrome_executable() is None:
+        return False, (
+            "Google Chrome tidak ditemukan di komputer Anda.\n\n"
+            "Install Chrome dari https://www.google.com/chrome/ lalu coba "
+            "lagi. Kalau Chrome terinstal di lokasi non-standar, set "
+            "environment variable SHOPEELINK_CHROME_PATH ke path lengkap "
+            "chrome.exe sebelum membuka aplikasi."
+        )
     return True, ""
 
 
@@ -148,14 +216,17 @@ class BrowserSession:
         self,
         profile_dir: Optional[str] = None,
         headless: bool = False,
-        channel: str = "chrome",
+        chrome_path: Optional[str] = None,
     ):
         self.profile_dir = profile_dir or chrome_profile_dir()
         self.headless = headless
-        self.channel = channel
+        self.chrome_path = chrome_path
+        self._proc: Optional[subprocess.Popen] = None
         self._pw = None
+        self._browser = None  # Browser (from connect_over_cdp)
         self._ctx = None  # BrowserContext
         self._page = None  # Page
+        self._cdp_port: Optional[int] = None
 
     # ----- lifecycle ----------------------------------------------------
 
@@ -167,54 +238,128 @@ class BrowserSession:
         self.close()
 
     def start(self) -> None:
-        if self._ctx is not None:
+        """Launch Chrome as a subprocess and attach Playwright via CDP.
+
+        We deliberately avoid ``playwright.chromium.launch_persistent_context``
+        because Playwright's launcher injects automation flags that Shopee's
+        anti-bot system fingerprints. Instead we ``Popen`` Chrome ourselves
+        with only ``--remote-debugging-port`` and ``--user-data-dir``, then
+        attach via ``connect_over_cdp`` — Chrome looks identical to one a
+        user just opened by hand (no infobar, no ``navigator.webdriver``).
+        """
+        if self._page is not None:
             return
+        chrome_exe = self.chrome_path or find_chrome_executable()
+        if not chrome_exe:
+            raise AffiliateError(
+                "Google Chrome tidak ditemukan. Install dari "
+                "https://www.google.com/chrome/ lalu coba lagi.\n\n"
+                "Kalau Chrome terinstal di lokasi non-standar, set "
+                "environment variable SHOPEELINK_CHROME_PATH ke path "
+                "lengkap chrome.exe sebelum membuka aplikasi."
+            )
+        port = _find_free_port()
+        cmd = [
+            chrome_exe,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={self.profile_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            # Suppress some Chrome features that delay first paint.
+            "--disable-features=Translate,OptimizationHints",
+        ]
+        if self.headless:
+            # Modern headless mode (--headless=new) uses the same renderer
+            # as headed Chrome, so anti-bot fingerprints stay consistent.
+            cmd.append("--headless=new")
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                # On Windows, prevent Ctrl+C in our Python from killing Chrome.
+                creationflags=(
+                    subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+                    if sys.platform == "win32"
+                    else 0
+                ),
+            )
+        except OSError as e:
+            self._proc = None
+            raise AffiliateError(
+                f"Gagal meluncurkan Chrome.\n\nDetail: {e}\n\n"
+                "Pastikan Google Chrome sudah terinstal."
+            ) from e
+        self._cdp_port = port
+        # Poll the CDP HTTP endpoint until Chrome is ready (or it dies).
+        ready_url = f"http://127.0.0.1:{port}/json/version"
+        deadline = time.time() + DEFAULT_LAUNCH_TIMEOUT_S
+        while time.time() < deadline:
+            if self._proc.poll() is not None:
+                self._proc = None
+                raise AffiliateError(
+                    "Chrome langsung keluar saat dijalankan. Mungkin ada "
+                    "window Chrome lain yang memakai folder profile yang "
+                    "sama. Tutup window Chrome shopeelink yang lain dan "
+                    "coba lagi."
+                )
+            try:
+                with urllib.request.urlopen(ready_url, timeout=1):
+                    break
+            except Exception:  # noqa: BLE001
+                time.sleep(0.3)
+        else:
+            self._kill_proc()
+            raise AffiliateError("Chrome tidak siap dalam 30 detik.")
         try:
             from playwright.sync_api import sync_playwright  # type: ignore[import-not-found]
         except ImportError as e:
+            self._kill_proc()
             raise AffiliateError(
                 "Library 'playwright' tidak ditemukan. Install dulu via "
                 "`pip install playwright` lalu coba lagi."
             ) from e
-
         self._pw = sync_playwright().start()
         try:
-            self._ctx = self._pw.chromium.launch_persistent_context(
-                user_data_dir=self.profile_dir,
-                channel=self.channel,
-                headless=self.headless,
-                viewport={"width": 1100, "height": 800},
-                accept_downloads=False,
-                args=["--no-first-run", "--no-default-browser-check"],
+            self._browser = self._pw.chromium.connect_over_cdp(
+                f"http://127.0.0.1:{port}"
             )
         except Exception as e:  # noqa: BLE001
             self._stop_pw()
+            self._kill_proc()
             raise AffiliateError(
-                "Gagal meluncurkan Chrome.\n\n"
-                f"Detail: {e}\n\n"
-                "Pastikan Google Chrome sudah terinstal di komputer Anda. "
-                "Kalau sudah ada, kemungkinan ada instance Chrome lain yang "
-                "sedang memakai folder profile yang sama — tutup aplikasi "
-                "ini dan coba lagi."
+                f"Gagal connect ke Chrome via CDP.\n\nDetail: {e}"
             ) from e
-
-        # Re-use existing tab if any, else open a new one.
+        # Re-use the default browser context (the persistent profile).
+        if self._browser.contexts:
+            self._ctx = self._browser.contexts[0]
+        else:
+            self._ctx = self._browser.new_context()
         if self._ctx.pages:
             self._page = self._ctx.pages[0]
         else:
             self._page = self._ctx.new_page()
-        self._page.set_default_navigation_timeout(DEFAULT_NAV_TIMEOUT_MS)
-        self._page.set_default_timeout(DEFAULT_NAV_TIMEOUT_MS)
+        try:
+            self._page.set_default_navigation_timeout(DEFAULT_NAV_TIMEOUT_MS)
+            self._page.set_default_timeout(DEFAULT_NAV_TIMEOUT_MS)
+        except Exception:  # noqa: BLE001
+            pass
 
     def close(self) -> None:
-        if self._ctx is not None:
+        # Disconnect Playwright first. For ``connect_over_cdp`` browsers
+        # this is a no-op on the Chrome side (Chrome stays alive), so we
+        # still need to kill the subprocess afterwards.
+        if self._browser is not None:
             try:
-                self._ctx.close()
+                self._browser.close()
             except Exception:  # noqa: BLE001
                 pass
-            self._ctx = None
-            self._page = None
+        self._browser = None
+        self._ctx = None
+        self._page = None
         self._stop_pw()
+        self._kill_proc()
+        self._cdp_port = None
 
     def _stop_pw(self) -> None:
         if self._pw is not None:
@@ -223,6 +368,45 @@ class BrowserSession:
             except Exception:  # noqa: BLE001
                 pass
             self._pw = None
+
+    def _kill_proc(self) -> None:
+        """Stop the Chrome subprocess, gracefully if possible.
+
+        Chrome only flushes cookies/localStorage to the persistent profile
+        on graceful shutdown, so we try ``terminate``/``taskkill`` (no
+        ``/F``) first and only force-kill on timeout.
+        """
+        if self._proc is None:
+            return
+        try:
+            if sys.platform == "win32":
+                # taskkill without /F sends WM_CLOSE — Chrome handles this
+                # like the user pressed the X button (cookies are saved).
+                subprocess.run(
+                    ["taskkill", "/pid", str(self._proc.pid), "/T"],
+                    capture_output=True,
+                    timeout=5,
+                )
+            else:
+                self._proc.terminate()
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                if sys.platform == "win32":
+                    subprocess.run(
+                        ["taskkill", "/pid", str(self._proc.pid), "/T", "/F"],
+                        capture_output=True,
+                        timeout=5,
+                    )
+                else:
+                    self._proc.kill()
+                try:
+                    self._proc.wait(timeout=5)
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+        self._proc = None
 
     # ----- login --------------------------------------------------------
 
@@ -308,7 +492,6 @@ class BrowserSession:
         except Exception:  # noqa: BLE001
             pass
 
-        import time
         deadline = time.monotonic() + timeout_s
         # Require two consecutive positive samples (≈ 3s apart) to declare
         # login. That's another guard against catching the dashboard URL
