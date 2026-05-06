@@ -22,4 +22,8 @@ if [ ! -x "$VENV_DIR/bin/python" ]; then
     "$VENV_DIR/bin/python" -m pip install -r requirements.txt
 fi
 
+# Make sure new dependencies (e.g. playwright in v1.3.0) are installed even
+# if the venv was created by an older release.
+"$VENV_DIR/bin/python" -m pip install -r requirements.txt --quiet --disable-pip-version-check
+
 exec "$VENV_DIR/bin/python" shopeelink_gui.py "$@"

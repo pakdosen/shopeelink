@@ -29,9 +29,11 @@ Tag      : PF1
 Output   : https://s.shopee.co.id/901ojkZNEU
 ```
 
-> Generate link membutuhkan akun Shopee Affiliate Anda. Tool memanggil endpoint
-> `batchCustomLink` yang sama dengan dashboard, memakai cookies/csrf-token yang
-> Anda import sekali (lihat [Tab "Generate Affiliate Link"](#tab-generate-affiliate-link)).
+> Generate link membutuhkan akun Shopee Affiliate Anda. Tool men-drive Chrome
+> Anda sendiri (via Playwright dengan `channel="chrome"` — Chromium tidak
+> di-download terpisah). Anda login sekali di window Chrome khusus shopeelink,
+> lalu Generate berikutnya tinggal klik. Lihat
+> [Tab "Generate Affiliate Link"](#tab-generate-affiliate-link).
 
 ## Aplikasi Desktop (GUI) — paling mudah
 
@@ -75,36 +77,51 @@ Dua cara, pilih salah satu:
 | :---: | :---: |
 | ![Generate tab light mode](docs/generate-tab-light.png) | ![Generate tab dark mode](docs/generate-tab-dark.png) |
 
-Sekali setup (Import sesi affiliate Anda dari browser), Anda bisa generate
-puluhan/ratusan short link sekaligus tanpa repot membuka dashboard.
+Sekali login (Hubungkan Chrome), Anda bisa generate puluhan/ratusan short
+link sekaligus tanpa repot membuka dashboard.
 
-**Setup sekali (Import cURL):**
+**Persyaratan**: Google Chrome harus terinstal di komputer Anda. Tool akan
+menjalankan Chrome Anda dengan profile khusus shopeelink (terpisah dari
+profile pribadi Anda) sehingga session login dijaga lokal di
+`%APPDATA%\shopeelink\chrome-profile`.
 
-1. Buka https://affiliate.shopee.co.id/offer/custom_link di Chrome dan login.
-2. Tekan **F12** untuk membuka DevTools → klik tab **Network**.
-3. Centang **Preserve log** dan filter ke **Fetch/XHR**.
-4. Di form Custom Link, isi 1 long URL apa saja → klik **Buat Link**.
-5. Di Network tab, klik kanan request `gql?q=batchCustomLink` →
-   **Copy** → **Copy as cURL** (atau **Copy as cURL (bash)**).
-6. Di aplikasi shopeelink, buka tab **Generate Affiliate Link** → klik
-   **Import dari cURL…** → paste cURL → klik **Import**.
+**Setup sekali (Hubungkan Chrome):**
 
-   ![Import cURL dialog](docs/import-curl-dialog.png)
+1. Buka aplikasi shopeelink → tab **Generate Affiliate Link** → klik
+   **Hubungkan Chrome…**.
+2. Sebuah window Chrome muncul di halaman login affiliate.
+   Login dengan akun affiliate Anda.
+3. Setelah login berhasil, tool otomatis mendeteksi dan menutup window Chrome.
+   Status berubah jadi `Profile tersimpan di …`.
 
-Sesi disimpan lokal di komputer Anda saja:
-- Windows: `%APPDATA%\shopeelink\session.json`
-- macOS: `~/Library/Application Support/shopeelink/session.json`
-- Linux: `~/.config/shopeelink/session.json`
+Profile Chrome tersimpan lokal:
+- Windows: `%APPDATA%\shopeelink\chrome-profile`
+- macOS: `~/Library/Application Support/shopeelink/chrome-profile`
+- Linux: `~/.config/shopeelink/chrome-profile`
+
+Klik **Reset profile** untuk menghapusnya kalau Anda ingin login dengan akun
+yang berbeda.
 
 **Generate link:**
 
 1. Isi tag (Sub-ID) jika perlu — Tag 1 sampai Tag 5. Boleh kosong; kalau
    diisi, tag yang sama akan dipakai untuk semua link batch ini.
 2. Tempel long URL di textarea **Long URL** — satu URL per baris.
-3. Klik **Generate**. Hasil short link muncul di **Hasil short link**.
+3. Klik **Generate**. Sebuah window Chrome muncul sebentar untuk mengambil
+   data, lalu hasil short link muncul di **Hasil short link**.
 
-> Cookies bisa kedaluwarsa (biasanya beberapa hari). Kalau muncul `HTTP
-> 401/403`, ulangi langkah Import cURL untuk refresh sesi Anda.
+> Kalau muncul error login, klik **Hubungkan Chrome…** lagi untuk login
+> ulang. Profile session bisa kedaluwarsa setelah beberapa hari, sama seperti
+> kalau Anda login di Chrome biasa.
+
+**Kenapa pakai browser, bukan replay cURL?** Endpoint
+`batchCustomLink` dilindungi oleh signature anti-bot Shopee
+(`X-Sap-Sec`, `Af-Ac-Enc-*`) yang dihitung oleh JS SDK Shopee per-request
+berdasarkan body request + timestamp. Replay cURL tidak bekerja karena
+signature jadi tidak valid begitu body berubah — hasilnya HTTP 200 dengan
+batch kosong (silent reject) atau HTTP 403 dengan `error: 90309999`. Dengan
+men-drive Chrome, kita biarkan SDK Shopee yang menandatangani request, jadi
+Shopee menerimanya seperti request normal dari dashboard.
 
 ## Pemakaian via CLI
 
@@ -200,6 +217,8 @@ pip install -r requirements.txt pyinstaller
 pyinstaller --noconfirm --onefile --windowed `
     --name "ShopeeLinkConverter" `
     --collect-all customtkinter `
+    --collect-all playwright `
+    --collect-binaries playwright `
     shopeelink_gui.py
 # Hasil ada di dist\ShopeeLinkConverter.exe
 ```

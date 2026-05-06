@@ -8,7 +8,9 @@ tetap responsif.
 Aplikasi terdiri dari dua tab:
 - **Decode Short Link** — convert short link Shopee ke link produk asli.
 - **Generate Affiliate Link** — generate short affiliate link dari long URL +
-  tag (sub-id), memakai sesi affiliate Anda yang di-import via cURL.
+  tag (sub-id). Sejak v1.3 fitur ini men-drive Chrome Anda via Playwright
+  (``channel="chrome"``) supaya request ditandatangani oleh JS SDK Shopee
+  sendiri — replay cURL tidak bekerja karena anti-bot signature.
 """
 from __future__ import annotations
 
@@ -26,6 +28,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import affiliate  # noqa: E402
+import affiliate_browser  # noqa: E402
 import shopeelink  # noqa: E402
 
 try:
@@ -38,9 +41,11 @@ import tkinter as tk  # noqa: E402
 from tkinter import messagebox, ttk  # noqa: E402
 
 APP_TITLE = "Shopee Link Converter"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.0"
 DEFAULT_TIMEOUT = 15.0
 RESULT_POLL_MS = 80
+# How long the "Hubungkan Chrome" worker waits for the user to log in.
+LOGIN_TIMEOUT_S = 600
 
 
 def _split_input(raw: str) -> List[str]:
@@ -97,7 +102,7 @@ class _CTKApp:  # pragma: no cover - GUI
         self._queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self._decode_worker: threading.Thread | None = None
         self._affiliate_worker: threading.Thread | None = None
-        self._session: affiliate.Session | None = affiliate.load_session()
+        self._connect_worker: threading.Thread | None = None
 
         self._build()
         self._poll_queue()
@@ -251,7 +256,7 @@ class _CTKApp:  # pragma: no cover - GUI
         session_card.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(
-            session_card, text="Sesi Affiliate", font=ctk.CTkFont(weight="bold")
+            session_card, text="Profile Chrome", font=ctk.CTkFont(weight="bold")
         ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 0))
 
         self.gen_session_lbl = ctk.CTkLabel(
@@ -265,17 +270,18 @@ class _CTKApp:  # pragma: no cover - GUI
             row=1, column=0, columnspan=3, sticky="ew", padx=12, pady=(0, 8)
         )
 
-        ctk.CTkButton(
+        self.gen_connect_btn = ctk.CTkButton(
             session_card,
-            text="Import dari cURL…",
-            width=160,
+            text="Hubungkan Chrome…",
+            width=180,
             height=32,
-            command=self._on_open_import_dialog,
-        ).grid(row=2, column=0, sticky="w", padx=12, pady=(0, 12))
+            command=self._on_connect_browser,
+        )
+        self.gen_connect_btn.grid(row=2, column=0, sticky="w", padx=12, pady=(0, 12))
 
         ctk.CTkButton(
             session_card,
-            text="Hapus sesi",
+            text="Reset profile",
             width=120,
             height=32,
             fg_color="transparent",
@@ -283,16 +289,17 @@ class _CTKApp:  # pragma: no cover - GUI
             text_color=("gray10", "gray90"),
             border_color=("gray60", "gray40"),
             hover_color=("gray85", "gray25"),
-            command=self._on_clear_session,
+            command=self._on_reset_profile,
         ).grid(row=2, column=1, sticky="w", padx=(0, 12), pady=(0, 12))
 
         ctk.CTkLabel(
             session_card,
             text=(
-                "Cara import: di Chrome buka affiliate.shopee.co.id → DevTools "
-                "(F12) → tab Network → submit 1 link di Custom Link → klik "
-                "kanan request 'gql?q=batchCustomLink' → Copy → Copy as cURL "
-                "(bash) → paste di dialog Import."
+                "Klik 'Hubungkan Chrome…' — sebuah window Chrome akan terbuka "
+                "dengan profile khusus shopeelink. Login ke "
+                "affiliate.shopee.co.id sekali; profile-nya tersimpan dan "
+                "tidak perlu login ulang. Anti-bot Shopee diatasi karena "
+                "request dikirim dari halaman dashboard yang asli."
             ),
             text_color=("gray45", "gray55"),
             wraplength=800,
@@ -472,60 +479,70 @@ class _CTKApp:  # pragma: no cover - GUI
     # ------------------------------------------------------------------
 
     def _session_status_text(self) -> str:
-        if self._session is None:
-            return (
-                "Belum ada sesi. Klik 'Import dari cURL…' untuk mengimport "
-                "session affiliate Anda."
-            )
-        return f"Tersimpan di {affiliate.session_file_path()} — {self._session.cookie_summary}"
+        return affiliate_browser.profile_summary()
 
     def _refresh_session_label(self) -> None:
         self.gen_session_lbl.configure(text=self._session_status_text())
 
-    def _on_open_import_dialog(self) -> None:
-        dialog = _ImportCurlDialog(self.root, on_submit=self._on_import_curl)
-        dialog.show()
+    def _on_connect_browser(self) -> None:
+        if self._connect_worker is not None and self._connect_worker.is_alive():
+            return
+        ok, msg = affiliate_browser.ensure_browser_available()
+        if not ok:
+            messagebox.showerror("Playwright belum siap", msg, parent=self.root)
+            return
+        self.gen_connect_btn.configure(state="disabled")
+        self._set_generate_status(
+            "Membuka Chrome — silakan login di window yang muncul…"
+        )
+        self.gen_progress.configure(mode="indeterminate")
+        self.gen_progress.start()
+        self._connect_worker = threading.Thread(
+            target=self._run_connect, daemon=True
+        )
+        self._connect_worker.start()
 
-    def _on_import_curl(self, text: str) -> None:
+    def _run_connect(self) -> None:
         try:
-            session = affiliate.Session.from_curl(text)
-            affiliate.save_session(session)
+            with affiliate_browser.BrowserSession(headless=False) as bs:
+                ok = bs.wait_for_login(timeout_s=LOGIN_TIMEOUT_S)
+            if ok:
+                self._queue.put(("connect_done", "Login terdeteksi — profile tersimpan."))
+            else:
+                self._queue.put(
+                    (
+                        "connect_error",
+                        "Tidak terdeteksi login dalam waktu yang ditentukan. "
+                        "Coba lagi.",
+                    )
+                )
         except affiliate.AffiliateError as e:
-            messagebox.showerror("Import gagal", str(e), parent=self.root)
-            return
+            self._queue.put(("connect_error", str(e)))
         except Exception as e:  # noqa: BLE001
-            messagebox.showerror("Import gagal", f"Error: {e}", parent=self.root)
-            return
-        self._session = session
-        self._refresh_session_label()
-        self._set_generate_status("Sesi berhasil disimpan.")
+            self._queue.put(("connect_error", f"Error tak terduga: {e}"))
 
-    def _on_clear_session(self) -> None:
-        if self._session is None:
-            self._set_generate_status("Belum ada sesi yang tersimpan.")
-            return
+    def _on_reset_profile(self) -> None:
         if not messagebox.askyesno(
-            "Hapus sesi",
-            "Hapus sesi affiliate yang tersimpan? Anda perlu Import cURL "
-            "lagi untuk generate link.",
+            "Reset profile Chrome",
+            "Hapus profile Chrome shopeelink? Anda perlu klik 'Hubungkan "
+            "Chrome…' dan login ulang setelah ini.",
             parent=self.root,
         ):
             return
-        affiliate.clear_session()
-        self._session = None
+        try:
+            affiliate_browser.reset_profile()
+        except affiliate.AffiliateError as e:
+            messagebox.showerror("Reset gagal", str(e), parent=self.root)
+            return
         self._refresh_session_label()
-        self._set_generate_status("Sesi dihapus.")
+        self._set_generate_status("Profile Chrome di-reset.")
 
     def _on_generate(self) -> None:
         if self._affiliate_worker is not None and self._affiliate_worker.is_alive():
             return
-        if self._session is None:
-            messagebox.showwarning(
-                "Sesi belum di-import",
-                "Klik 'Import dari cURL…' dulu untuk mengimport sesi affiliate "
-                "Anda sebelum generate link.",
-                parent=self.root,
-            )
+        ok, msg = affiliate_browser.ensure_browser_available()
+        if not ok:
+            messagebox.showerror("Playwright belum siap", msg, parent=self.root)
             return
         urls = _split_input(self.gen_input_box.get("1.0", "end"))
         if not urls:
@@ -548,22 +565,19 @@ class _CTKApp:  # pragma: no cover - GUI
         self.gen_progress.start()
 
         show_input = self.gen_show_input_var.get()
-        session = self._session
         self._affiliate_worker = threading.Thread(
-            target=self._run_generate, args=(items, session, show_input), daemon=True
+            target=self._run_generate, args=(items, show_input), daemon=True
         )
         self._affiliate_worker.start()
 
     def _run_generate(
         self,
         items: List[affiliate.LinkInput],
-        session: affiliate.Session,
         show_input: bool,
     ) -> None:
         try:
-            results = affiliate.generate_short_links(
-                items, session, timeout=DEFAULT_TIMEOUT
-            )
+            with affiliate_browser.BrowserSession(headless=False) as bs:
+                results = bs.generate(items)
             text = _format_affiliate_results(results, show_input)
             errors = sum(1 for r in results if not r.ok)
             self._queue.put(("affiliate_done", (text, len(results), errors)))
@@ -645,102 +659,27 @@ class _CTKApp:  # pragma: no cover - GUI
                     self.gen_progress.stop()
                     self.gen_progress.configure(mode="determinate")
                     self.gen_progress.set(0)
+                elif kind == "connect_done":
+                    self._refresh_session_label()
+                    self._set_generate_status(str(payload))
+                    self.gen_connect_btn.configure(state="normal")
+                    self.gen_progress.stop()
+                    self.gen_progress.configure(mode="determinate")
+                    self.gen_progress.set(0)
+                elif kind == "connect_error":
+                    self._refresh_session_label()
+                    self._set_generate_output(f"ERROR: {payload}")
+                    self._set_generate_status("Connect Chrome gagal.")
+                    self.gen_connect_btn.configure(state="normal")
+                    self.gen_progress.stop()
+                    self.gen_progress.configure(mode="determinate")
+                    self.gen_progress.set(0)
         except queue.Empty:
             pass
         self.root.after(RESULT_POLL_MS, self._poll_queue)
 
     def run(self) -> None:
         self.root.mainloop()
-
-
-# ---------------------------------------------------------------------------
-# Import-cURL dialog (customtkinter)
-# ---------------------------------------------------------------------------
-
-
-class _ImportCurlDialog:  # pragma: no cover - GUI
-    def __init__(self, master, on_submit) -> None:
-        self.on_submit = on_submit
-        self.top = ctk.CTkToplevel(master)
-        self.top.title("Import sesi dari cURL")
-        self.top.geometry("760x520")
-        self.top.transient(master)
-        self.top.grab_set()
-        self.top.grid_columnconfigure(0, weight=1)
-        self.top.grid_rowconfigure(2, weight=1)
-
-        ctk.CTkLabel(
-            self.top,
-            text="Paste perintah cURL dari DevTools",
-            font=ctk.CTkFont(size=16, weight="bold"),
-        ).grid(row=0, column=0, sticky="w", padx=18, pady=(16, 4))
-
-        ctk.CTkLabel(
-            self.top,
-            text=(
-                "Di Chrome: F12 → Network → submit 1 link di Custom Link → "
-                "klik kanan request 'gql?q=batchCustomLink' → Copy → Copy as "
-                "cURL (bash). Paste lengkap di kotak di bawah."
-            ),
-            text_color=("gray35", "gray70"),
-            wraplength=720,
-            justify="left",
-        ).grid(row=1, column=0, sticky="w", padx=18, pady=(0, 8))
-
-        self.text = ctk.CTkTextbox(
-            self.top,
-            font=ctk.CTkFont(family="Consolas", size=12),
-            wrap="word",
-        )
-        self.text.grid(row=2, column=0, sticky="nsew", padx=18, pady=4)
-
-        actions = ctk.CTkFrame(self.top, fg_color="transparent")
-        actions.grid(row=3, column=0, sticky="ew", padx=18, pady=12)
-        actions.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(
-            actions,
-            text="Cookies disimpan lokal di komputer ini saja, tidak dikirim ke pihak ketiga.",
-            text_color=("gray45", "gray60"),
-        ).grid(row=0, column=0, sticky="w")
-
-        ctk.CTkButton(
-            actions,
-            text="Cancel",
-            width=100,
-            fg_color="transparent",
-            border_width=1,
-            text_color=("gray10", "gray90"),
-            border_color=("gray60", "gray40"),
-            hover_color=("gray85", "gray25"),
-            command=self._cancel,
-        ).grid(row=0, column=1, padx=(8, 6))
-
-        ctk.CTkButton(
-            actions,
-            text="Import",
-            width=120,
-            font=ctk.CTkFont(weight="bold"),
-            command=self._submit,
-        ).grid(row=0, column=2)
-
-    def _cancel(self) -> None:
-        self.top.destroy()
-
-    def _submit(self) -> None:
-        text = self.text.get("1.0", "end").strip()
-        if not text:
-            messagebox.showwarning(
-                "Input kosong",
-                "Paste cURL dulu sebelum klik Import.",
-                parent=self.top,
-            )
-            return
-        self.top.destroy()
-        self.on_submit(text)
-
-    def show(self) -> None:
-        self.text.focus_set()
 
 
 # ---------------------------------------------------------------------------
@@ -757,7 +696,7 @@ class _TkApp:  # pragma: no cover - GUI
         self._queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self._decode_worker: threading.Thread | None = None
         self._affiliate_worker: threading.Thread | None = None
-        self._session: affiliate.Session | None = affiliate.load_session()
+        self._connect_worker: threading.Thread | None = None
 
         style = ttk.Style()
         if "clam" in style.theme_names():
@@ -824,13 +763,14 @@ class _TkApp:  # pragma: no cover - GUI
         parent.rowconfigure(3, weight=1)
         parent.rowconfigure(6, weight=2)
 
-        session_card = ttk.LabelFrame(parent, text="Sesi Affiliate", padding=(10, 6))
+        session_card = ttk.LabelFrame(parent, text="Profile Chrome", padding=(10, 6))
         session_card.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
         session_card.columnconfigure(0, weight=1)
         self.gen_session_lbl = ttk.Label(session_card, text=self._session_status_text(), foreground="#666")
         self.gen_session_lbl.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
-        ttk.Button(session_card, text="Import dari cURL…", command=self._on_open_import_dialog).grid(row=1, column=0, sticky="w")
-        ttk.Button(session_card, text="Hapus sesi", command=self._on_clear_session).grid(row=1, column=1, sticky="w", padx=(8, 0))
+        self.gen_connect_btn = ttk.Button(session_card, text="Hubungkan Chrome…", command=self._on_connect_browser)
+        self.gen_connect_btn.grid(row=1, column=0, sticky="w")
+        ttk.Button(session_card, text="Reset profile", command=self._on_reset_profile).grid(row=1, column=1, sticky="w", padx=(8, 0))
 
         tag_frame = ttk.Frame(parent, padding=(8, 6))
         tag_frame.grid(row=2, column=0, sticky="ew")
@@ -919,79 +859,57 @@ class _TkApp:  # pragma: no cover - GUI
 
     # ----- generate handlers -----
     def _session_status_text(self) -> str:
-        if self._session is None:
-            return "Belum ada sesi. Klik 'Import dari cURL…' untuk mengimport session affiliate."
-        return f"Tersimpan di {affiliate.session_file_path()} — {self._session.cookie_summary}"
+        return affiliate_browser.profile_summary()
 
     def _refresh_session_label(self) -> None:
         self.gen_session_lbl.configure(text=self._session_status_text())
 
-    def _on_open_import_dialog(self) -> None:
-        top = tk.Toplevel(self.root)
-        top.title("Import sesi dari cURL")
-        top.geometry("700x480")
-        top.transient(self.root)
-        top.grab_set()
-        top.columnconfigure(0, weight=1)
-        top.rowconfigure(2, weight=1)
-        ttk.Label(top, text="Paste perintah cURL dari DevTools", font=("Segoe UI", 12, "bold")).grid(row=0, column=0, sticky="w", padx=12, pady=(12, 4))
-        ttk.Label(top, text=(
-            "F12 → Network → submit 1 link di Custom Link → klik kanan "
-            "'gql?q=batchCustomLink' → Copy → Copy as cURL (bash)."
-        ), foreground="#666", wraplength=660, justify="left").grid(row=1, column=0, sticky="w", padx=12)
-        text = tk.Text(top, wrap="word", font=("Consolas", 10))
-        text.grid(row=2, column=0, sticky="nsew", padx=12, pady=8)
-        actions = ttk.Frame(top, padding=(12, 8))
-        actions.grid(row=3, column=0, sticky="ew")
-        actions.columnconfigure(0, weight=1)
-        ttk.Label(actions, text="Cookies disimpan lokal saja.", foreground="#888").grid(row=0, column=0, sticky="w")
+    def _on_connect_browser(self) -> None:
+        if self._connect_worker is not None and self._connect_worker.is_alive():
+            return
+        ok, msg = affiliate_browser.ensure_browser_available()
+        if not ok:
+            messagebox.showerror("Playwright belum siap", msg, parent=self.root)
+            return
+        self.gen_connect_btn.configure(state="disabled")
+        self._set_generate_status("Membuka Chrome — silakan login di window yang muncul…")
+        self.gen_progress.configure(mode="indeterminate")
+        self.gen_progress.start(10)
+        self._connect_worker = threading.Thread(
+            target=self._run_connect, daemon=True
+        )
+        self._connect_worker.start()
 
-        def submit() -> None:
-            content = text.get("1.0", "end").strip()
-            if not content:
-                messagebox.showwarning("Input kosong", "Paste cURL dulu.", parent=top)
-                return
-            top.destroy()
-            self._on_import_curl(content)
-
-        ttk.Button(actions, text="Cancel", command=top.destroy).grid(row=0, column=1, padx=(8, 6))
-        ttk.Button(actions, text="Import", command=submit).grid(row=0, column=2)
-        text.focus_set()
-
-    def _on_import_curl(self, text: str) -> None:
+    def _run_connect(self) -> None:
         try:
-            session = affiliate.Session.from_curl(text)
-            affiliate.save_session(session)
+            with affiliate_browser.BrowserSession(headless=False) as bs:
+                ok = bs.wait_for_login(timeout_s=LOGIN_TIMEOUT_S)
+            if ok:
+                self._queue.put(("connect_done", "Login terdeteksi — profile tersimpan."))
+            else:
+                self._queue.put(("connect_error", "Tidak terdeteksi login dalam waktu yang ditentukan."))
         except affiliate.AffiliateError as e:
-            messagebox.showerror("Import gagal", str(e), parent=self.root)
-            return
+            self._queue.put(("connect_error", str(e)))
         except Exception as e:  # noqa: BLE001
-            messagebox.showerror("Import gagal", f"Error: {e}", parent=self.root)
-            return
-        self._session = session
-        self._refresh_session_label()
-        self._set_generate_status("Sesi berhasil disimpan.")
+            self._queue.put(("connect_error", f"Error tak terduga: {e}"))
 
-    def _on_clear_session(self) -> None:
-        if self._session is None:
-            self._set_generate_status("Belum ada sesi yang tersimpan.")
+    def _on_reset_profile(self) -> None:
+        if not messagebox.askyesno("Reset profile Chrome", "Hapus profile Chrome shopeelink?", parent=self.root):
             return
-        if not messagebox.askyesno("Hapus sesi", "Hapus sesi affiliate?", parent=self.root):
+        try:
+            affiliate_browser.reset_profile()
+        except affiliate.AffiliateError as e:
+            messagebox.showerror("Reset gagal", str(e), parent=self.root)
             return
-        affiliate.clear_session()
-        self._session = None
         self._refresh_session_label()
-        self._set_generate_status("Sesi dihapus.")
+        self._set_generate_status("Profile Chrome di-reset.")
 
     def _on_generate(self) -> None:
         if self._affiliate_worker is not None and self._affiliate_worker.is_alive():
             return
-        if self._session is None:
-            messagebox.showwarning(
-                "Sesi belum di-import",
-                "Klik 'Import dari cURL…' dulu untuk mengimport sesi affiliate Anda.",
-                parent=self.root,
-            )
+        ok, msg = affiliate_browser.ensure_browser_available()
+        if not ok:
+            messagebox.showerror("Playwright belum siap", msg, parent=self.root)
             return
         urls = _split_input(self.gen_input_box.get("1.0", "end"))
         if not urls:
@@ -1011,20 +929,19 @@ class _TkApp:  # pragma: no cover - GUI
         self.gen_progress.configure(mode="indeterminate")
         self.gen_progress.start(10)
         show_input = self.gen_show_input_var.get()
-        session = self._session
         self._affiliate_worker = threading.Thread(
-            target=self._run_generate, args=(items, session, show_input), daemon=True
+            target=self._run_generate, args=(items, show_input), daemon=True
         )
         self._affiliate_worker.start()
 
     def _run_generate(
         self,
         items: List[affiliate.LinkInput],
-        session: affiliate.Session,
         show_input: bool,
     ) -> None:
         try:
-            results = affiliate.generate_short_links(items, session, timeout=DEFAULT_TIMEOUT)
+            with affiliate_browser.BrowserSession(headless=False) as bs:
+                results = bs.generate(items)
             text = _format_affiliate_results(results, show_input)
             errors = sum(1 for r in results if not r.ok)
             self._queue.put(("affiliate_done", (text, len(results), errors)))
@@ -1092,6 +1009,19 @@ class _TkApp:  # pragma: no cover - GUI
                     self._set_generate_output(f"ERROR: {payload}")
                     self._set_generate_status("Terjadi error.")
                     self.gen_generate_btn.configure(state="normal")
+                    self.gen_progress.stop()
+                    self.gen_progress.configure(mode="determinate", value=0)
+                elif kind == "connect_done":
+                    self._refresh_session_label()
+                    self._set_generate_status(str(payload))
+                    self.gen_connect_btn.configure(state="normal")
+                    self.gen_progress.stop()
+                    self.gen_progress.configure(mode="determinate", value=0)
+                elif kind == "connect_error":
+                    self._refresh_session_label()
+                    self._set_generate_output(f"ERROR: {payload}")
+                    self._set_generate_status("Connect Chrome gagal.")
+                    self.gen_connect_btn.configure(state="normal")
                     self.gen_progress.stop()
                     self.gen_progress.configure(mode="determinate", value=0)
         except queue.Empty:
