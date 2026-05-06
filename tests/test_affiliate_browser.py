@@ -17,11 +17,20 @@ import affiliate_browser as ab
 class _FakePage:
     """Minimal stand-in for ``playwright.sync_api.Page``."""
 
-    def __init__(self, navigations=None, evaluate_result=None, evaluate_error=None):
+    def __init__(
+        self,
+        navigations=None,
+        evaluate_result=None,
+        evaluate_error=None,
+        has_login_form=False,
+    ):
         self.url = ""
         self._navigations = list(navigations or [])
         self._evaluate_result = evaluate_result
         self._evaluate_error = evaluate_error
+        # Whether the page currently contains an input[type=password] (used
+        # by the new DOM-based login detector).
+        self.has_login_form = has_login_form
         self.evaluate_calls: list = []
 
     # --- navigation -------------------------------------------------------
@@ -49,6 +58,11 @@ class _FakePage:
         self.evaluate_calls.append((script, payload))
         if self._evaluate_error:
             raise self._evaluate_error
+        # The DOM-based login probe is a tiny inline arrow function. If we
+        # see it, answer based on ``has_login_form`` instead of returning
+        # the canned fetch result.
+        if isinstance(script, str) and 'input[type="password"]' in script:
+            return self.has_login_form
         return self._evaluate_result
 
 
@@ -71,9 +85,9 @@ class ChromeProfileDirTests(unittest.TestCase):
 
 
 class DashboardLoadedTests(unittest.TestCase):
-    def _bs(self, url: str) -> ab.BrowserSession:
+    def _bs(self, url: str, has_login_form: bool = False) -> ab.BrowserSession:
         bs = ab.BrowserSession.__new__(ab.BrowserSession)
-        bs._page = _FakePage()
+        bs._page = _FakePage(has_login_form=has_login_form)
         bs._page.url = url
         return bs
 
@@ -82,6 +96,7 @@ class DashboardLoadedTests(unittest.TestCase):
             "https://affiliate.shopee.co.id/login",
             "https://shopee.co.id/buyer-login?redirect_url=affiliate",
             "https://accounts.shopee.co.id/login",
+            "https://shopee.co.id/buyer/login?next=affiliate",
         ]:
             with self.subTest(bad=bad):
                 self.assertFalse(self._bs(bad)._dashboard_loaded())
@@ -93,6 +108,18 @@ class DashboardLoadedTests(unittest.TestCase):
 
     def test_empty_url_returns_false(self) -> None:
         self.assertFalse(self._bs("")._dashboard_loaded())
+
+    def test_dashboard_url_with_login_form_returns_false(self) -> None:
+        # Regression for the v1.3.0 bug: the URL momentarily reads as the
+        # affiliate dashboard while Shopee's SPA is still client-side
+        # redirecting to /buyer/login. A live login form means we're not
+        # actually logged in, regardless of the URL.
+        self.assertFalse(
+            self._bs(
+                "https://affiliate.shopee.co.id/offer/custom_link",
+                has_login_form=True,
+            )._dashboard_loaded()
+        )
 
 
 class GenerateTests(unittest.TestCase):
@@ -225,6 +252,21 @@ class WaitForLoginTests(unittest.TestCase):
     def test_returns_false_after_timeout(self) -> None:
         page = _FakePage(
             navigations=["https://affiliate.shopee.co.id/login"]
+        )
+        bs = ab.BrowserSession.__new__(ab.BrowserSession)
+        bs._page = page
+        ok = bs.wait_for_login(poll_interval_s=0.01, timeout_s=0.05)
+        self.assertFalse(ok)
+
+    def test_does_not_return_early_when_login_form_visible(self) -> None:
+        # Regression for v1.3.0 race: even though the URL is on the
+        # affiliate dashboard, a visible login form means the user hasn't
+        # finished logging in. wait_for_login MUST keep polling until
+        # timeout in this case (otherwise Chrome closes before the user
+        # types their password).
+        page = _FakePage(
+            navigations=["https://affiliate.shopee.co.id/offer/custom_link"],
+            has_login_form=True,
         )
         bs = ab.BrowserSession.__new__(ab.BrowserSession)
         bs._page = page

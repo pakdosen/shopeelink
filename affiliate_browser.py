@@ -240,19 +240,51 @@ class BrowserSession:
         return self._dashboard_loaded()
 
     def _dashboard_loaded(self) -> bool:
-        """Heuristic: dashboard URL stayed on the affiliate domain & not /login."""
+        """Return True only if the page is *actually* on the dashboard.
+
+        We check both the URL **and** the DOM, because Shopee's dashboard
+        redirect chain looks like:
+
+        1. ``GET /offer/custom_link`` → 302 to ``affiliate.shopee.co.id`` SPA.
+        2. SPA boots; sees no auth cookie; client-side ``location.replace``
+           to ``shopee.co.id/buyer/login?next=…``.
+
+        Between steps 1 and 2 the URL is still on ``affiliate.shopee.co.id``
+        even though we're not really logged in. Polling the URL alone leads
+        to a false positive that closes Chrome before the user can finish
+        logging in (see github.com/pakdosen/shopeelink#7 follow-up). So we
+        also reject when the live DOM contains a login form.
+        """
         try:
             url = self._page.url  # type: ignore[union-attr]
         except Exception:  # noqa: BLE001
             return False
         if not url:
             return False
-        # If we got bounced to a login screen the URL will contain /login or
-        # /buyer-login or shopee.co.id login.
-        bad_markers = ("/login", "buyer-login", "redirect_url=", "creatorhub")
+        # Hard reject any login-flow URL Shopee may redirect through.
+        bad_markers = (
+            "/login",
+            "buyer-login",
+            "redirect_url=",
+            "creatorhub",
+            "shopee.co.id/buyer",
+        )
         if any(m in url for m in bad_markers):
             return False
-        return "affiliate.shopee.co.id" in url
+        if "affiliate.shopee.co.id" not in url:
+            return False
+        # URL says affiliate dashboard, but the SPA may still be in the
+        # middle of the redirect to login. Probe the DOM: if there's a
+        # password input visible we're NOT logged in.
+        try:
+            has_login_form = self._page.evaluate(  # type: ignore[union-attr]
+                "() => !!document.querySelector('input[type=\"password\"]')"
+            )
+        except Exception:  # noqa: BLE001
+            has_login_form = False
+        if has_login_form:
+            return False
+        return True
 
     def wait_for_login(self, poll_interval_s: float = 1.5, timeout_s: float = 600) -> bool:
         """Poll until the user has logged in, or ``timeout_s`` elapses.
@@ -264,24 +296,38 @@ class BrowserSession:
             raise AffiliateError("BrowserSession belum di-start().")
 
         # Send the user to the dashboard. If they aren't logged in Shopee
-        # redirects to the login page automatically.
+        # redirects to the login page automatically. Wait until the network
+        # actually settles so any client-side redirect to /buyer/login has
+        # had a chance to fire before we sample the URL for the first time.
         try:
             self._page.goto(DASHBOARD_URL, wait_until="domcontentloaded")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._page.wait_for_load_state("networkidle", timeout=15_000)
         except Exception:  # noqa: BLE001
             pass
 
         import time
         deadline = time.monotonic() + timeout_s
+        # Require two consecutive positive samples (≈ 3s apart) to declare
+        # login. That's another guard against catching the dashboard URL
+        # briefly between SPA boot and the JS redirect to login.
+        positive_samples = 0
         while time.monotonic() < deadline:
             if self._dashboard_loaded():
-                # Give the SPA a moment to fully boot the SDK that signs
-                # requests; otherwise the first generate may still be
-                # rejected.
-                try:
-                    self._page.wait_for_load_state("networkidle", timeout=8_000)
-                except Exception:  # noqa: BLE001
-                    pass
-                return True
+                positive_samples += 1
+                if positive_samples >= 2:
+                    # Give the SPA a moment to fully boot the SDK that
+                    # signs requests; otherwise the first generate may
+                    # still be rejected.
+                    try:
+                        self._page.wait_for_load_state("networkidle", timeout=8_000)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return True
+            else:
+                positive_samples = 0
             time.sleep(poll_interval_s)
         return False
 
